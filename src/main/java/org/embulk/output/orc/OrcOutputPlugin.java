@@ -6,7 +6,6 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
-import org.apache.hadoop.hive.ql.exec.vector.VectorizedRowBatch;
 import org.apache.hadoop.util.VersionInfo;
 import org.apache.orc.CompressionKind;
 import org.apache.orc.OrcFile;
@@ -16,15 +15,12 @@ import org.embulk.config.ConfigDiff;
 import org.embulk.config.ConfigSource;
 import org.embulk.config.TaskReport;
 import org.embulk.config.TaskSource;
-import org.embulk.spi.Column;
 import org.embulk.spi.Exec;
 import org.embulk.spi.OutputPlugin;
-import org.embulk.spi.Page;
 import org.embulk.spi.PageReader;
 import org.embulk.spi.Schema;
 import org.embulk.spi.TransactionalPageOutput;
 import org.embulk.spi.time.TimestampFormatter;
-import org.embulk.spi.type.Type;
 import org.embulk.spi.util.Timestamps;
 import org.embulk.util.aws.credentials.AwsCredentials;
 
@@ -88,36 +84,6 @@ public class OrcOutputPlugin
         return pathPrefix + String.format(sequenceFormat, processorIndex) + pathSuffix;
     }
 
-    private TypeDescription getSchema(Schema schema)
-    {
-        TypeDescription oschema = TypeDescription.createStruct();
-        for (int i = 0; i < schema.size(); i++) {
-            Column column = schema.getColumn(i);
-            Type type = column.getType();
-            switch (type.getName()) {
-                case "long":
-                    oschema.addField(column.getName(), TypeDescription.createLong());
-                    break;
-                case "double":
-                    oschema.addField(column.getName(), TypeDescription.createDouble());
-                    break;
-                case "boolean":
-                    oschema.addField(column.getName(), TypeDescription.createBoolean());
-                    break;
-                case "string":
-                    oschema.addField(column.getName(), TypeDescription.createString());
-                    break;
-                case "timestamp":
-                    oschema.addField(column.getName(), TypeDescription.createTimestamp());
-                    break;
-                default:
-                    System.out.println("Unsupported type");
-                    break;
-            }
-        }
-        return oschema;
-    }
-
     private Configuration getHadoopConfiguration(PluginTask task)
     {
         Configuration conf = new Configuration();
@@ -149,7 +115,7 @@ public class OrcOutputPlugin
                 .newTimestampColumnFormatters(task, schema, task.getColumnOptions());
 
         Configuration conf = getHadoopConfiguration(task);
-        TypeDescription oschema = getSchema(schema);
+        TypeDescription oschema = OrcOutputPluginHelper.getOutputSchema(schema);
 
         // see: https://groups.google.com/forum/#!topic/vertx/lLb-slzpWVg
         Thread.currentThread().setContextClassLoader(VersionInfo.class.getClassLoader());
@@ -184,77 +150,5 @@ public class OrcOutputPlugin
                 .blockSize(blockSize)
                 .stripeSize(stripSize)
                 .compress(kind);
-    }
-
-    class OrcTransactionalPageOutput
-            implements TransactionalPageOutput
-    {
-        private final PageReader reader;
-        private final Writer writer;
-
-        public OrcTransactionalPageOutput(PageReader reader, Writer writer, PluginTask task)
-        {
-            this.reader = reader;
-            this.writer = writer;
-        }
-
-        @Override
-        public void add(Page page)
-        {
-            synchronized (this) {
-                try {
-                    // int size = page.getStringReferences().size();
-                    final TypeDescription schema = getSchema(reader.getSchema());
-                    final VectorizedRowBatch batch = schema.createRowBatch();
-                    // batch.size = size;
-
-                    reader.setPage(page);
-                    while (reader.nextRecord()) {
-                        final int row = batch.size++;
-                        reader.getSchema().visitColumns(
-                                new OrcColumnVisitor(reader, batch, row)
-                        );
-                        if (batch.size >= batch.getMaxSize()) {
-                            writer.addRowBatch(batch);
-                            batch.reset();
-                        }
-                    }
-                    if (batch.size != 0) {
-                        writer.addRowBatch(batch);
-                        batch.reset();
-                    }
-                }
-                catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
-        }
-
-        @Override
-        public void finish()
-        {
-            try {
-                writer.close();
-            }
-            catch (IOException e) {
-                Throwables.propagate(e);
-            }
-        }
-
-        @Override
-        public void close()
-        {
-        }
-
-        @Override
-        public void abort()
-        {
-        }
-
-        @Override
-        public TaskReport commit()
-        {
-            return Exec.newTaskReport();
-        }
     }
 }
